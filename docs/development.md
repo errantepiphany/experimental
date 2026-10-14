@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Rust stable 1.96+
+- Rust stable 1.96.1+
 - Rust nightly (for `rustfmt`)
 - `cargo-machete` (unused dependency detection)
 - `cargo-audit`, `cargo-deny` (supply chain safety)

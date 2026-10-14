@@ -19,7 +19,7 @@ with real crates when scaffolding a project.
 
 ## Requirements
 
-- Rust stable 1.96+
+- Rust stable 1.96.1+
 - Rust nightly (for `rustfmt`)
 
 ## Quick Reference

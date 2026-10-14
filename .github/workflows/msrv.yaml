@@ -42,14 +42,19 @@ jobs:
             echo "empty=true" >> "$GITHUB_OUTPUT"
           else
             echo "empty=false" >> "$GITHUB_OUTPUT"
+            msrv=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+            echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Rust (MSRV)
         if: steps.ws.outputs.empty == 'false'
         uses: ./.github/actions/setup-rust
         with:
+          rust-version: ${{ steps.ws.outputs.msrv }}
           cache-suffix: msrv
 
       - name: Check workspace compiles on MSRV
         if: steps.ws.outputs.empty == 'false'
-        run: cargo check --workspace
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.ws.outputs.msrv }}
+        run: cargo check --workspace --locked
