@@ -7,6 +7,10 @@ maximum-db-staleness = "P30D"
 ignore = [
   # derivative 2.2.0: unmaintained
   "RUSTSEC-2024-0388",
+  # unsafe-libyaml 0.2.11: unmaintained, inherited through the pinned AI
+  # v0.4.1 release and Praxis core's serde_yaml 0.9.34. Our own YAML parser
+  # already uses yaml_serde; remove this exception when upstream migrates.
+  "RUSTSEC-2024-0449",
   # rustls-pemfile 2.2.0: unmaintained
   "RUSTSEC-2025-0134",
   # lru 0.16.4: unsound LruCache::pop() panic safety, via

@@ -248,6 +248,11 @@ mod cases {
         register(&dir, &credential, true);
         let callback = make_filter(&dir, "callback");
         assert_eq!(
+            callback.request_body_access(),
+            BodyAccess::ReadOnly,
+            "callback must read its buffered credential"
+        );
+        assert_eq!(
             callback.request_body_mode(),
             BodyMode::StreamBuffer {
                 max_bytes: Some(16_384)
@@ -413,6 +418,113 @@ mod cases {
             matches!(verifier.authenticate(&"x".repeat(8193)).await, Err(AuthError::Invalid)),
             "bounded credential"
         );
+    }
+
+    #[tokio::test]
+    async fn callback_accepts_the_body_limit_and_rejects_larger_bodies() {
+        let (dir, _verifier, signing) = fixture();
+        let credential = token(&signing, &serde_json::json!({}));
+        register(&dir, &credential, true);
+        let filter = make_filter(&dir, "callback");
+        let request = make_request("/validate");
+        let encoded = serde_json::to_vec(&serde_json::json!({"key": credential})).unwrap();
+        for (size, status) in [(16_384, 200), (16_385, 413), (16_386, 413)] {
+            let mut body = encoded.clone();
+            body.resize(size, b' ');
+            let mut context = make_ctx(&request);
+            context.buffered_request_body = Some(body.into());
+            assert_status(filter.on_request(&mut context).await.unwrap(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_token_size_limit_is_inclusive() {
+        let (dir, verifier, signing) = fixture();
+        for size in [8192, 8193, 8194] {
+            let credential = sized_token(&signing, size);
+            register(&dir, &credential, true);
+            let result = verifier.authenticate(&credential).await;
+            if size == 8192 {
+                assert_eq!(result.unwrap(), "alice", "signed token at the size limit is valid");
+            } else {
+                assert!(
+                    matches!(result, Err(AuthError::Invalid)),
+                    "oversized signed token is rejected: {size}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_size_limit_is_inclusive() {
+        let (dir, verifier, signing) = fixture();
+        let credential = token(&signing, &serde_json::json!({}));
+        register(&dir, &credential, true);
+        let registry = std::fs::read(dir.path().join("users.json")).unwrap();
+        for size in [1_048_576, 1_048_577, 1_048_578] {
+            let mut padded = registry.clone();
+            padded.resize(size, b' ');
+            std::fs::write(dir.path().join("users.json"), padded).unwrap();
+            let result = verifier.authenticate(&credential).await;
+            if size == 1_048_576 {
+                assert_eq!(result.unwrap(), "alice", "registry at the size limit is valid");
+            } else {
+                assert!(
+                    matches!(result, Err(AuthError::Unavailable)),
+                    "oversized registry fails closed: {size}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_validates_every_subject_and_digest_independently() {
+        let (dir, verifier, signing) = fixture();
+        let credential = token(&signing, &serde_json::json!({}));
+        for (subject, digest) in [
+            (".bob", "a".repeat(64)),
+            ("bob", "a".repeat(63)),
+            ("bob", "z".repeat(64)),
+        ] {
+            register(&dir, &credential, true);
+            let path = dir.path().join("users.json");
+            let mut registry: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            registry.get_mut("users").unwrap().as_object_mut().unwrap().insert(
+                subject.to_owned(),
+                serde_json::json!({"active": true, "digest": digest}),
+            );
+            std::fs::write(path, registry.to_string()).unwrap();
+            assert!(
+                matches!(verifier.authenticate(&credential).await, Err(AuthError::Unavailable)),
+                "invalid entry must reject the entire registry even when Alice's entry is valid: {subject}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Generate a signed, otherwise valid credential with an exact wire size.
+    fn sized_token(signing: &EncodingKey, size: usize) -> String {
+        for key_length in 0..4 {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("k".repeat(key_length));
+            let mut claims = serde_json::json!({"iss": "issuer", "aud": "audience", "sub": "alice", "iat": 1, "jti": "one", "padding": ""});
+            let baseline = jsonwebtoken::encode(&header, &claims, signing).unwrap().len();
+            let estimate = size.saturating_sub(baseline).saturating_mul(3).saturating_div(4);
+            for padding in estimate.saturating_sub(2)..estimate.saturating_add(4) {
+                claims
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("padding".into(), serde_json::Value::String("x".repeat(padding)));
+                let candidate = jsonwebtoken::encode(&header, &claims, signing).unwrap();
+                if candidate.len() == size {
+                    return candidate;
+                }
+            }
+        }
+        panic!("could not generate a signed credential of {size} bytes");
     }
 
     #[test]

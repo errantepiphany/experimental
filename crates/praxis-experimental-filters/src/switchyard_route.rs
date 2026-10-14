@@ -41,7 +41,7 @@ const METADATA_DECISION: &str = "switchyard_route.decision";
 const METADATA_ERROR: &str = "switchyard_route.error";
 
 /// Default max body size for buffering (1 MiB).
-const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 
 /// The `switchyard_route` HTTP filter.
 pub(crate) struct SwitchyardRouteFilter {
@@ -510,9 +510,7 @@ fn body_preview(body: &Bytes) -> String {
 
 /// Builds the Capability-mode classifier from config.
 fn build_algorithm(config: &RouteConfig) -> Result<Arc<dyn Algorithm>, FilterError> {
-    use switchyard_libsy::{
-        ClassifierContractConfig, LlmClassifierConfig, LlmTarget, LlmTaskClassifier, TaskClassifierConfig,
-    };
+    use switchyard_libsy::{LlmClassifierConfig, LlmTarget, LlmTaskClassifier, TaskClassifierConfig};
 
     let classifier_config = LlmClassifierConfig::Capability {
         judge_target: LlmTarget {
@@ -529,8 +527,6 @@ fn build_algorithm(config: &RouteConfig) -> Result<Arc<dyn Algorithm>, FilterErr
         },
         config: TaskClassifierConfig {
             base_threshold: config.threshold,
-            session_affinity: false,
-            contract: ClassifierContractConfig::default(),
             ..TaskClassifierConfig::default()
         },
     };
@@ -977,6 +973,7 @@ mod tests {
                         if !complete {
                             break;
                         }
+                        assert_judge_request(&raw);
                         let index = served.fetch_add(1, Ordering::SeqCst).min(responses.len() - 1);
                         let (status_line, body) = &responses[index];
                         let response = format!(
@@ -998,6 +995,192 @@ mod tests {
     fn make_client() -> SubRequestClient {
         praxis_tls::provider::install();
         SubRequestClient::new(SubRequestConnector::new(2, None))
+    }
+
+    /// Verify the actual HTTP payload before the mock judge supplies its verdict.
+    fn assert_judge_request(raw: &[u8]) {
+        let text = std::str::from_utf8(raw).expect("judge request is UTF-8");
+        let (headers, body) = text
+            .split_once("\r\n\r\n")
+            .expect("judge request has headers and a body");
+        assert!(headers.starts_with("POST "), "judge call must use POST");
+        let value: serde_json::Value = serde_json::from_str(body).expect("judge call carries JSON");
+        assert_eq!(value["model"], "judge-model", "judge uses its configured model");
+        assert_ne!(
+            value.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "judge response is buffered whether stream is false or omitted"
+        );
+        assert!(
+            !value["messages"].as_array().expect("judge has messages").is_empty(),
+            "encoded judge prompt is mandatory"
+        );
+    }
+
+    /// Emits a side-call decision before the final routing decision.
+    struct ScriptedAlgorithm;
+
+    #[async_trait]
+    impl Algorithm for ScriptedAlgorithm {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn create_run_task(
+            self: Arc<Self>,
+            ctx: switchyard_protocol::Context,
+            driver: switchyard_libsy::Driver,
+            _request: switchyard_protocol::Request,
+        ) -> switchyard_libsy::Result<switchyard_protocol::Response> {
+            driver
+                .info(
+                    ctx.clone(),
+                    Arc::new(ScriptedDecision {
+                        model: "judge",
+                        routed: false,
+                    }),
+                )
+                .await?;
+            driver
+                .info(
+                    ctx,
+                    Arc::new(ScriptedDecision {
+                        model: "weak",
+                        routed: true,
+                    }),
+                )
+                .await?;
+            Ok(switchyard_protocol::Response {
+                llm_response: switchyard_protocol::LlmResponse::Agg(switchyard_protocol::AggLlmResponse::default()),
+                metadata: None,
+            })
+        }
+    }
+
+    /// Explicitly distinguishes side calls from final routes in the scripted stream.
+    struct ScriptedDecision {
+        /// Semantic target named by the decision.
+        model: &'static str,
+        /// Whether this decision chooses the final backend.
+        routed: bool,
+    }
+
+    impl switchyard_protocol::Decision for ScriptedDecision {
+        fn selected_model(&self) -> &str {
+            self.model
+        }
+
+        fn is_routed_call(&self) -> bool {
+            self.routed
+        }
+
+        fn reasoning(&self) -> Option<&str> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Records structured events without adding a logging dependency to the filter.
+    struct EventCollector {
+        /// Captured field sets shared with test assertions.
+        events: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    }
+
+    impl tracing::Subscriber for EventCollector {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = EventFields {
+                values: std::collections::BTreeMap::new(),
+            };
+            event.record(&mut fields);
+            self.events.lock().expect("event collector lock").push(fields.values);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Visitor preserving each event's named field values.
+    struct EventFields {
+        /// Structured values represented in their tracing debug form.
+        values: std::collections::BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for EventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.values.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_steps_ignore_side_calls_and_select_the_final_route() {
+        let config = config::parse(&config_yaml("http://127.0.0.1:9/judge", "closed")).expect("test config");
+        let filter = SwitchyardRouteFilter {
+            config,
+            algorithm: Arc::new(ScriptedAlgorithm),
+            sessions: Mutex::new(session::SessionStore::with_defaults()),
+        };
+        let client = make_client();
+        let llm =
+            decode_for_judge(&serde_json::from_slice(&chat_body("hello")).expect("chat JSON")).expect("chat decode");
+        assert_eq!(
+            filter.decide(&client, llm).await.expect("scripted routing decision"),
+            Tier::Weak,
+            "a judge side decision is ignored while the final weak decision is accepted"
+        );
+    }
+
+    #[test]
+    fn verdict_and_fallback_logs_preserve_demo_decisions_and_fields() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = EventCollector {
+            events: Arc::clone(&events),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_judge_verdict(judge_body(&verdict(0.95, "SUP-1", "supported")).as_bytes());
+            log_failure_apply(failure::FailureApply {
+                tier: Tier::Weak,
+                kind: failure::FailureApplyKind::Reuse,
+            });
+            log_failure_apply(failure::FailureApply {
+                tier: Tier::Strong,
+                kind: failure::FailureApplyKind::DefaultStrong,
+            });
+        });
+        let captured = events.lock().expect("captured events").clone();
+        assert_eq!(captured.len(), 3, "each verdict and fallback emits its demo event");
+        assert_eq!(
+            captured[0]["message"], "switchyard_route: judge verdict",
+            "verdict event remains greppable"
+        );
+        assert_eq!(captured[0]["p_solve"], "Some(0.95)", "verdict probability is recorded");
+        assert_eq!(captured[0]["rule"], "\"SUP-1\"", "verdict rule is recorded");
+        assert_eq!(captured[0]["boundary"], "\"supported\"", "verdict boundary is recorded");
+        assert_eq!(
+            captured[1]["message"], "switchyard_route: reuse",
+            "reuse event remains greppable"
+        );
+        assert_eq!(captured[1]["tier"], "weak", "reuse reports the actual remembered tier");
+        assert_eq!(
+            captured[2]["message"], "switchyard_route: default_strong",
+            "default event remains greppable"
+        );
+        assert_eq!(captured[2]["tier"], "strong", "default reports the fallback tier");
     }
 
     // -----------------------------------------------------------------------

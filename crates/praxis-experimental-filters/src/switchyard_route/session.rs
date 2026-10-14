@@ -124,10 +124,7 @@ impl SessionStore {
 
     /// Floor on: `max(stored, incoming)`. Floor off: incoming as-is.
     ///
-    /// Assumes expired entries were already removed by [`Self::last_success`]
-    /// (which calls [`Self::drop_if_idle`]) before this function runs.
-    /// All current call sites go through `route()` → `last_success()` →
-    /// judge → `remember()`, so a stale entry is never present here.
+    /// [`Self::remember`] sweeps expired LRU nodes before computing the floor.
     fn tier_to_store(&self, map_key: &str, incoming: Tier, session_floor: SessionFloor) -> Tier {
         match session_floor {
             SessionFloor::Disabled => incoming,
@@ -158,7 +155,7 @@ impl SessionStore {
         Some(tier)
     }
 
-    /// Drops the key when idle TTL has elapsed. Returns whether it was dropped or absent.
+    /// Check the key independently because concurrent callers may supply out-of-order timestamps.
     fn drop_if_idle(&mut self, key: &SessionKey, now: Instant) -> bool {
         let Some(entry) = self.entries.get(key.as_str()) else {
             return true;
@@ -178,7 +175,8 @@ impl SessionStore {
 
     /// Drops stale recency nodes and idle entries from the front of the list.
     fn sweep(&mut self, now: Instant) {
-        loop {
+        // Every iteration removes an original node or stops at the first live entry.
+        for _ in 0..self.recency.len() {
             match self.inspect_front(now) {
                 None | Some(FrontAction::Keep) => break,
                 Some(FrontAction::DropNode) => {
@@ -568,6 +566,118 @@ mod tests {
             store.last_success(&quiet, now),
             Some(Tier::Weak),
             "idle key must survive compaction"
+        );
+    }
+    #[test]
+    fn lookup_expires_an_idle_key_behind_a_fresh_front_node() {
+        let mut store = SessionStore::new(Duration::from_secs(10), 8);
+        let fresh = SessionKey {
+            inner: "h:fresh".into(),
+        };
+        let idle = SessionKey { inner: "h:idle".into() };
+        let start = Instant::now();
+        store.remember(
+            &fresh,
+            Tier::Strong,
+            start + Duration::from_secs(5),
+            SessionFloor::Enabled,
+        );
+        store.remember(&idle, Tier::Weak, start, SessionFloor::Enabled);
+        assert_eq!(
+            store.last_success(&idle, start + Duration::from_secs(11)),
+            None,
+            "independent expiry must catch old timestamps behind a fresh LRU node"
+        );
+        assert!(
+            !store.entries.contains_key(idle.as_str()),
+            "expired entry is removed from storage"
+        );
+        assert_eq!(
+            store.last_success(&fresh, start + Duration::from_secs(11)),
+            Some(Tier::Strong),
+            "fresh front survives the independent expiry check"
+        );
+    }
+
+    #[test]
+    fn sweep_expires_idle_entries_without_looking_up_their_keys() {
+        let mut store = SessionStore::new(Duration::from_secs(10), 8);
+        let key = SessionKey { inner: "h:idle".into() };
+        let missing = SessionKey {
+            inner: "h:missing".into(),
+        };
+        let start = Instant::now();
+        store.remember(&key, Tier::Strong, start, SessionFloor::Enabled);
+        assert_eq!(
+            store.last_success(&missing, start + Duration::from_secs(12)),
+            None,
+            "lookup of another key remains a miss"
+        );
+        assert!(store.entries.is_empty(), "sweep reclaims every expired live entry");
+        assert!(
+            store.recency.is_empty(),
+            "sweep also reclaims the expired recency nodes"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_entries_at_the_exact_idle_ttl() {
+        let mut store = SessionStore::new(Duration::from_secs(10), 8);
+        let key = SessionKey {
+            inner: "h:boundary".into(),
+        };
+        let start = Instant::now();
+        store.remember(&key, Tier::Weak, start, SessionFloor::Enabled);
+        assert_eq!(
+            store.last_success(&key, start + Duration::from_secs(10)),
+            Some(Tier::Weak),
+            "the idle TTL is inclusive and a hit refreshes it"
+        );
+        assert_eq!(
+            store.last_success(&key, start + Duration::from_secs(20)),
+            Some(Tier::Weak),
+            "the refreshed TTL is also inclusive"
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_only_current_nodes_after_the_bound_is_exceeded() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 8);
+        let quiet = SessionKey {
+            inner: "h:quiet".into(),
+        };
+        let hot = SessionKey { inner: "h:hot".into() };
+        let now = Instant::now();
+        store.remember(&quiet, Tier::Weak, now, SessionFloor::Enabled);
+        store.remember(&hot, Tier::Strong, now, SessionFloor::Enabled);
+        for expected_nodes in [3, 4, 2] {
+            assert_eq!(
+                store.last_success(&hot, now),
+                Some(Tier::Strong),
+                "hot lookup survives compaction"
+            );
+            assert_eq!(
+                store.recency.len(),
+                expected_nodes,
+                "compact only after stale nodes exceed twice the live entries"
+            );
+        }
+        assert_eq!(
+            store.recency.front().unwrap().map_key,
+            quiet.as_str(),
+            "quiet node remains least recent"
+        );
+        assert!(
+            store.recency.iter().all(|node| store
+                .entries
+                .get(&node.map_key)
+                .is_some_and(|entry| entry.seq == node.seq)),
+            "compaction retains current stamps and deletes stale duplicates"
+        );
+        assert_eq!(
+            store.last_success(&quiet, now),
+            Some(Tier::Weak),
+            "quiet key survives compaction"
         );
     }
 }

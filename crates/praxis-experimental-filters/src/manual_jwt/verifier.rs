@@ -91,11 +91,7 @@ impl Verifier {
         let claims = jsonwebtoken::decode::<Claims>(token, &self.key, &self.validation)
             .map_err(|_error| AuthError::Invalid)?
             .claims;
-        if !valid_subject(&claims.sub)
-            || claims.jti.is_empty()
-            || claims.jti.len() > 128
-            || claims.iat > jsonwebtoken::get_current_timestamp()
-        {
+        if !valid_claims(&claims, jsonwebtoken::get_current_timestamp()) {
             return Err(AuthError::Invalid);
         }
         let registry = self.read_registry().await?;
@@ -133,6 +129,11 @@ impl Verifier {
     }
 }
 
+/// Validate identity and issuance against a single wall-clock snapshot.
+fn valid_claims(claims: &Claims, now: u64) -> bool {
+    valid_subject(&claims.sub) && !claims.jti.is_empty() && claims.jti.len() <= 128 && claims.iat <= now
+}
+
 /// Parse registry JSON without echoing its contents into diagnostics.
 fn decode_registry(data: &[u8]) -> Result<Registry, AuthError> {
     serde_json::from_slice(data).map_err(|error| {
@@ -158,4 +159,45 @@ fn valid_subject(subject: &str) -> bool {
         && subject
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.@-".contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Claims, valid_claims, valid_subject};
+
+    #[test]
+    fn subjects_require_a_safe_first_byte_length_and_alphabet() {
+        for subject in ["alice", "A_1.@-", &"a".repeat(128)] {
+            assert!(valid_subject(subject), "safe subject must be accepted: {subject:?}");
+        }
+        for subject in ["", ".alice", "-alice", "a b", "a\r\n", "é", &"a".repeat(129)] {
+            assert!(!valid_subject(subject), "unsafe subject must be rejected: {subject:?}");
+        }
+    }
+
+    #[test]
+    fn issuance_at_current_time_is_valid_and_future_issuance_is_not() {
+        let mut claims = Claims {
+            sub: "alice".into(),
+            iat: 42,
+            jti: "one".into(),
+        };
+        assert!(valid_claims(&claims, 42), "issuance at the current second is valid");
+        assert!(valid_claims(&claims, 43), "past issuance is valid");
+        assert!(!valid_claims(&claims, 41), "future issuance is rejected");
+        claims.jti.clear();
+        assert!(!valid_claims(&claims, 42), "missing credential identity is rejected");
+        claims.jti = "a".repeat(128);
+        assert!(valid_claims(&claims, 42), "credential identity accepts its size limit");
+        claims.jti.push('a');
+        assert!(!valid_claims(&claims, 42), "oversized credential identity is rejected");
+        claims.jti.push('a');
+        assert!(
+            !valid_claims(&claims, 42),
+            "identity rejection covers every size above the limit"
+        );
+        claims.jti = "one".into();
+        claims.sub = ".alice".into();
+        assert!(!valid_claims(&claims, 42), "safe identity remains mandatory");
+    }
 }
