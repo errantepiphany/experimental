@@ -9,7 +9,7 @@
 #
 # The Rust toolchain comes from the checksum-pinned upstream release tarball
 # rather than from RHEL's AppStream `rust-toolset`, which is 1.92 and so cannot
-# satisfy this workspace's `rust-version = "1.96"`. This is the same mechanism
+# satisfy this workspace's `rust-version = "1.96.1"`. This is the same mechanism
 # opendatahub-io/openshell uses; under a hermetic Konflux build the identical
 # tarball is prefetched to /cachi2/output/deps/generic, pinned by URL and
 # checksum in that pipeline's generic-fetcher lockfile, and the RUN below picks
